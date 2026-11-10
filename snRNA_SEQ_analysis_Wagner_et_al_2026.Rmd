@@ -1,0 +1,762 @@
+---
+title: "0_Data_processing"
+author: "Mariano Ruz Jurado"
+date: "2025-01-31"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#0. Load essential libraries
+```{r}
+#load libraries
+library(tidyverse)
+library(ggplot2)
+library(Seurat)
+library(openxlsx)
+library(DOtools)
+
+outputFolder <- "/mnt/mariano/Sequencing_Storage/20250128_MRJ001_snRNASEQ_24096_miR143_145-flox_Cdh5_CreERT2_(Cre+_vs_Cre-)_Julian /24096/"
+sink(file = paste0(outputFolder,"/analysis/20250128_MRJ001_Julian_24096_snRNA_miR143_145_Script.log"), append = TRUE, split = TRUE)
+```
+
+#1. Preprocessing data
+##1.1 Prepare Paths for import count matrixes from cellbender outputs
+```{r}
+Sample_Paths <- c(paste0(outputFolder,"raw-data/cellbender/19_S1"),
+                  paste0(outputFolder,"raw-data/cellbender/20_S2"),
+                  paste0(outputFolder,"raw-data/cellbender/42_S3"),
+                  paste0(outputFolder,"raw-data/cellbender/23_S4"))
+
+Sample_Names <- c("19_S1_ctrl","20_S2_miRNAko","42_S3_miRNAko","23_S4_ctrl")
+```
+
+##1.2 Run Importer function on ctrl + miRNA KO mice
+```{r}
+#import data, create SeuratObjects
+resultList<-list()
+SeuratObjectList <- list()
+for (i in 1:length(Sample_Paths)) {
+  resultList<-Importer(pathway = Sample_Paths[i],
+                       id = Sample_Names[i],
+                       CellBender = TRUE,
+                       FilterCells = TRUE,
+                       FilterByAbsoluteValues = TRUE,
+                       performScaling = TRUE,
+                       minFeatures=300,
+                       maxFeatures=6000,
+                       minCounts=500,
+                       maxCounts=15000,
+                       maxMito=0.05) 
+  
+  print(resultList[[2]])
+  SeuratObjectList[[i]]<-resultList[[1]]
+}
+
+```
+
+##1.3 Add disease information to the objects before integrating 
+```{r}
+SeuratObjectList[[1]]$condition <- "ctrl"
+SeuratObjectList[[2]]$condition <- "miRNAko"
+SeuratObjectList[[3]]$condition <- "miRNAko"
+SeuratObjectList[[4]]$condition <- "ctrl"
+
+```
+
+##1.4 Integration with CCA method
+```{r}
+merged_obj <- Reduce(function(x, y) merge(x, y), SeuratObjectList) 
+
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+merged_obj <- JoinLayers(merged_obj)
+
+library(scDblFinder) # Doublet removal
+SCE_merged_obj <- as.SingleCellExperiment(merged_obj)
+SCE_merged_obj <- scDblFinder(SCE_merged_obj, samples = "orig.ident")
+merged_obj$scDblFinder_score <- SCE_merged_obj$scDblFinder.score
+merged_obj$scDblFinder_class <- SCE_merged_obj$scDblFinder.class #singlet 60801  doublet  7029
+merged_obj <- subset(merged_obj, scDblFinder_class == "singlet") 
+
+merged_obj[["RNA"]] <- split(merged_obj[["RNA"]], f = merged_obj$orig.ident)
+Seu_miRNA <- IntegrateLayers(object = merged_obj, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", verbose = T)
+
+#re-join layers after integration
+Seu_miRNA <- JoinLayers(Seu_miRNA) # the individual scale layers remain after joining layers, remove them they are just unnecessary memory waste 
+layers_to_remove <- grep("^scale\\.data\\.", Layers(Seu_miRNA), value = TRUE)
+Seu_miRNA@assays$RNA@layers[layers_to_remove] <- NULL
+
+saveRDS(Seu_miRNA, file = "/mnt/mariano/Sequencing_Storage/20250128_MRJ001_Julian_24096_snRNA_miR143_145-flox_Cdh5_CreERT2 (Cre+ vs Cre-) /24096/analysis/objects/Seu_miRNA_preDoubletfinder.rds")
+```
+
+
+#2. Calculate neighbors, clusters and umap representation
+```{r}
+Seu_miRNA <- FindNeighbors(object = Seu_miRNA, reduction = "integrated.cca", dims = 1:10)
+Seu_miRNA <- FindClusters(Seu_miRNA, resolution = 0.6, algorithm=4, random.seed = 1234)
+Seu_miRNA <- RunUMAP(object = Seu_miRNA,
+                     reduction = "integrated.cca",
+                     dims = 1:10,
+                     spread = 1,
+                     min.dist = 0.3)
+
+
+
+p <- DimPlot(Seu_miRNA, group.by = "seurat_clusters", label = F, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+p <-LabelClusters(p, id  = "seurat_clusters", fontface="bold", box = F)
+
+ggsave(paste0(outputFolder, "analysis/plots/UMAPs/UMAP_seurat_cluster.pdf"), width = 8,height = 8, plot = p)
+
+Seu_miRNA <- DO.CellTypist(Seu_miRNA, runCelltypistUpdate=F)
+Seu_miRNA$annotation <- Seu_miRNA$predicted_labels_celltypist
+
+p <- DimPlot(Seu_miRNA, group.by = "predicted_labels_celltypist", label = F, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+p <-LabelClusters(p, id  = "predicted_labels_celltypist", fontface="bold", box = F)
+
+```
+
+##2.1 Refine Annotation
+
+```{r}
+#Reclustering using FindSubCLuster in a loop
+Seu_miRNA$seurat_Recluster <- as.vector(Seu_miRNA$seurat_clusters)
+for (cluster in unique(Seu_miRNA$seurat_clusters)) {
+  print(cluster)
+  Seu_miRNA <- FindSubCluster(Seu_miRNA,
+                            cluster = cluster,
+                            graph.name = "RNA_snn",
+                            algorithm = 4,
+                            resolution = 0.5)  
+  
+  cluster_cells <- rownames(Seu_miRNA@meta.data)[Seu_miRNA$seurat_clusters == cluster]
+  Seu_miRNA$seurat_Recluster[cluster_cells] <- Seu_miRNA$sub.cluster[cluster_cells]
+}
+Seu_miRNA$sub.cluster <- NULL
+
+#One Liner
+# SeuratObject <- Seu_miRNA
+# SeuratObject <- DO.FullRecluster(SeuratObject = SeuratObject,
+#                  res = 0.5,
+#                  algorithm = 4,
+#                  graph.name = "RNA_snn")
+
+p <- DimPlot(Seu_miRNA, group.by = "seurat_Recluster", label = F, cols = rep(umap_colors,5), raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+p <-LabelClusters(p, id  = "seurat_Recluster", fontface="bold", box = F)
+
+ggsave(paste0(outputFolder, "analysis/plots/UMAPs/UMAP_seurat_Recluster.pdf"), width = 8,height = 8, plot = p)
+
+
+#re-run annotation
+Seu_miRNA <- DO.CellTypist(Seu_miRNA, over_clustering = "seurat_Recluster", runCelltypistUpdate=F)
+
+p <- DimPlot(Seu_miRNA, group.by = "predicted_labels_celltypist", label = F, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+p <-LabelClusters(p, id  = "predicted_labels_celltypist", fontface="bold", box = F)
+
+ggsave(paste0(outputFolder, "analysis/plots/UMAPs/UMAP_predicted_cell_annotation.pdf"), width = 8,height = 8, plot = p)
+
+Seu_miRNA$annotation_refined <- Seu_miRNA$predicted_labels_celltypist
+table(Seu_miRNA$annotation_refined)
+
+Seu_miRNA$annotation_refined <- plyr::revalue(Seu_miRNA$annotation_refined,
+                                              c(`Adip1` = "Adip",
+                                                `B` = "B_cells",
+                                                `CD16+Mo` = "Ccr2+MP",
+                                                `CD4+T_naive` = "T_cells", # Cd4+ and Cd8+
+                                                `EC1_cap` = "Cap_EC",
+                                                `EC5_art` = "Art_EC",
+                                                `EC7_endocardial` = "End_EC",
+                                                `EC8_ln` = "Lym_EC",
+                                                `FB1` = "FB",
+                                                `FB2` = "FB",
+                                                `FB4_activated` = "Act_FB",
+                                                `FB5` = "FB",
+                                                `LYVE1+IGF1+MP` = "LYVE1+MP",
+                                                `Meso` = "Epic",
+                                                `NC1_glial` = "Neuro",
+                                                `NC2_glial_NGF+` = "PC",
+                                                `PC1_vent` = "PC",
+                                                `SMC1_basic` = "SMC",
+                                                `SMC2_art` = "SMC",
+                                                `vCM1` = "CM1"))
+#reannotated the separate CM cluster
+cluster_cells <- rownames(Seu_miRNA@meta.data)[Seu_miRNA$seurat_Recluster %in% c("15_1","15_2", "15_3")]
+Seu_miRNA$annotation_refined[cluster_cells] <- "CM2"
+cluster_cells <- rownames(Seu_miRNA@meta.data)[Seu_miRNA$seurat_Recluster %in% c("1_3","9_3")]
+Seu_miRNA$annotation_refined[cluster_cells] <- "FB"
+  
+p <- DimPlot(Seu_miRNA, group.by = "annotation_refined", label = F, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+p <-LabelClusters(p, id  = "annotation_refined", fontface="bold", box = F)
+
+ggsave(paste0(outputFolder, "analysis/plots/UMAPs/UMAP_Refined_cell_annotation.pdf"), width = 8,height = 8, plot = p)
+
+# saveRDS(Seu_miRNA, file = "/mnt/mariano/Sequencing_Storage/20250128_MRJ001_Julian_24096_snRNA_miR143_145-flox_Cdh5_CreERT2 (Cre+ vs Cre-) /24096/analysis/objects/250203_Seu_miRNA_annotated.rds")
+
+Seu_miRNA <- readRDS(file = "/mnt/mariano/Sequencing_Storage/20250128_MRJ001_snRNASEQ_24096_miR143_145-flox_Cdh5_CreERT2_(Cre+_vs_Cre-)_Julian /24096/analysis/objects/250203_Seu_miRNA_annotated.rds")
+
+
+```
+
+
+#3. Define Markers for each cluster
+
+```{r}
+#Calculate Top expressed Markers for annotation
+annotation_Markers<- FindAllMarkers(object = Seu_miRNA,
+                                    assay = "RNA",
+                                    group.by = "annotation_refined",
+                                    min.pct = 0.25,
+                                    logfc.threshold = 0.25)
+
+top_markers <- annotation_Markers %>%
+  dplyr::group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+#kick MT-genes
+MT.genes <- top_markers[grep(pattern = "MT-", top_markers$gene),]
+top_markers <- top_markers[!(top_markers$gene %in% MT.genes$gene),]
+
+DO.Dotplot(sce_object = Seu_miRNA,
+           Feature = top_markers,
+           group.by.x = "annotation_refined",
+           plot.margin = c(1,1,1,1),
+           annotation_x = T, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = T,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3
+        )
+
+ggsave(paste0(outputFolder,"analysis/plots/dotplots/TopExpressed_genes_per_celltype.pdf"), width = 19, height = 10)
+
+```
+
+#4. DEG analysis per cell type wilcoxon
+
+```{r}
+DEG_stats_collector <- list()
+for (dis.ident in c("miRNAko")) {
+  print(dis.ident)
+ for (celltype in unique(Seu_miRNA$annotation_refined)) {
+   print(celltype)
+   Seu_miRNA_celltype <- subset(Seu_miRNA, subset = annotation_refined == celltype) # for DEG analysis the normal subset function should still work
+  
+  DEG_stats <- FindMarkers(object = Seu_miRNA_celltype,
+                           ident.1 = dis.ident,
+                           ident.2 = "ctrl",
+                           min.pct = 0,
+                           logfc.threshold = 0,
+                           assay = "RNA",
+                           only.pos = F,
+                           test.use = "wilcox",
+                           group.by = "condition")
+  DEG_stats <- rownames_to_column(DEG_stats)
+  DEG_stats[["condition"]] <- dis.ident
+  DEG_stats[["celltype"]] <- celltype
+  
+  DEG_stats_collector <- rbind(DEG_stats_collector, DEG_stats)    
+  
+ }
+}
+
+write.xlsx(DEG_stats_collector, file = paste0(outputFolder, "/analysis/excels/DEG_analysis_nothresh_miRNAko_ctrl.xlsx"))
+
+```
+
+#5. Senescence Score
+
+```{r}
+#load senescence marker genes
+#Aging Atlas, CellAge, SenMayo, CellularSenescence,Fridman & Tainsky
+ff <- list.files(path = "/mnt/mariano/scStorage/DavidR/BioData/SenescenceScore/", pattern = "AgingAtlas*", full.names = TRUE, recursive = F)
+counts.files <- lapply(ff, read_csv)
+counts <- do.call(rbind, counts.files)
+AA_DF <- data.frame(Symbol=unique(counts$Symbol),
+                    dataset="AgingAtlas")
+
+CellAge <- read_tsv("/mnt/mariano/scStorage/DavidR/BioData/SenescenceScore/CellAge3.tsv")
+CellAge <- CellAge[CellAge$`Senescence Effect` == "Induces",]
+CA_DF <- data.frame(Symbol=unique(firstup(tolower(CellAge$`Gene symbol`))),
+                    dataset="CellAge")
+
+SenMayo <- read.xlsx("/mnt/mariano/scStorage/DavidR/BioData/SenescenceScore/SenMayo_Genes.xlsx", sheet = "mouse")
+SM_DF <- data.frame(Symbol=unique(SenMayo$`Gene(murine)`),
+                    dataset="SenMayo")
+
+FridTain <- read_csv("/mnt/mariano/scStorage/DavidR/BioData/SenescenceScore/Fridman&Tainsky.csv")
+FT_DF <- data.frame(Symbol=unique(firstup(tolower(FridTain$SYMBOL))),
+                    dataset="FridmanTainsky")
+
+library(GO.db)
+library(org.Mm.eg.db)
+go_terms <- as.data.frame(GOTERM)
+Sen_GO <- go_terms[go_terms$Term %in% "cellular senescence",]$go_id
+gene_id <- unlist(mget(Sen_GO, org.Mm.egGO2ALLEGS, ifnotfound = NA))
+gene_symbols <- mapIds(org.Mm.eg.db, keys = gene_id, keytype = "ENTREZID", column = "SYMBOL")
+CS_DF <- data.frame(Symbol=unique(gene_symbols),
+                    dataset="GO:0090398")
+
+Sen_DF <- rbind(AA_DF,CA_DF,SM_DF,FT_DF,CS_DF)
+# write.xlsx(Sen_DF, file = paste0(outputFolder,"analysis/excels/Senescence_markers_DF.xlsx"))
+
+
+#use combined genes to define senescetic cells
+Sen_DF_present <- Sen_DF$Symbol[Sen_DF$Symbol %in% rownames(Seu_miRNA)]
+
+```
+
+##5.1 Senescence Score per individual EC cluster (CTRL vs miRNAko)
+
+```{r}
+#combine major EC sub-cluster for defining Senescence over all ECs
+table(miRNA_obj$annotation_refined)
+miRNA_obj$annotation_refined <- plyr::revalue(
+    miRNA_obj$annotation_refined,
+        c("Cap_EC" = "EC",
+        "Art_EC" = "EC")
+)
+
+table(miRNA_obj$annotation_refined)
+
+
+miRNA_obj <- Seurat::AddModuleScore(miRNA_obj, features = list(Sen_DF_present), name = "Sen_Score")
+
+
+
+unique(miRNA_obj$annotation_refined)
+
+tmp <- miRNA_obj
+tmp$all <- ""
+
+tmp_EC <- DO.Subset(tmp, ident = "annotation_refined", ident_name = "EC")
+DO.VlnPlot(
+    tmp_EC,
+    Feature = "Sen_Score1",
+    group.by = "condition",
+    ctrl.condition = "ctrl",
+    group.by.2 = "all",
+    y_title = "Module Score",
+    test_use = "wilcox",
+    vector_colors = c("lightgrey", "firebrick4")
+) + ggplot2::ggtitle("Senescence Score in ECs")
+
+ggsave(paste0(outputFolder,"analysis/plots/Vlnplot_Senescence_Score_ECs_wilcoxon_ctrl_miRNAko.pdf"), width = 4, height = 5)
+
+```
+
+#6. Expression plots as Violins + SEM & p-values
+```{r}
+#Serpine1
+DO.VlnPlot(
+    tmp_EC,
+    Feature = "Serpine1",
+    group.by = "condition",
+    ctrl.condition = "ctrl",
+    group.by.2 = "all",
+    test_use = "wilcox",
+    vector_colors = c("lightgrey", "firebrick4")
+)
+
+ggsave(paste0(outputFolder,"analysis/plots/Vlnplot_Serpine1_ECs_wilcoxon_ctrl_miRNAko.pdf"), width = 4, height = 5)
+
+
+# Cdkn1a
+
+DO.VlnPlot(
+    tmp_EC,
+    Feature = "Cdkn1a",
+    group.by = "condition",
+    ctrl.condition = "ctrl",
+    group.by.2 = "all",
+    test_use = "wilcox",
+    vector_colors = c("lightgrey", "firebrick4")
+)
+
+ggsave(paste0(outputFolder,"analysis/plots/Vlnplot_Cdkn1a_ECs_wilcoxon_ctrl_miRNAko.pdf"), width = 4, height = 5)
+
+# Zbtb16
+
+DO.VlnPlot(
+    tmp_EC,
+    Feature = "Zbtb16",
+    group.by = "condition",
+    ctrl.condition = "ctrl",
+    group.by.2 = "all",
+    test_use = "wilcox",
+    vector_colors = c("lightgrey", "firebrick4")
+)
+
+ggsave(paste0(outputFolder,"analysis/plots/Vlnplot_Zbtb16_ECs_wilcoxon_ctrl_miRNAko.pdf"), width = 4, height = 5)
+
+```
+
+
+#7. Receptor Ligand analysis using CellChat
+
+##7.1 Create CellChat object for miRNAko
+```{r}
+library(CellChat)
+library(patchwork)
+
+miRNA_obj_ko <- DO.Subset(miRNA_obj,
+                          ident = "condition",
+                          ident_name = "miRNAko")
+
+#CellChat assumes a column called samples with orig.ident information
+miRNA_obj_ko$samples <- miRNA_obj_ko$orig.ident
+miRNA_obj_ko$samples <- factor(miRNA_obj_ko$samples)
+
+CC_miRNAko <- createCellChat(miRNA_obj_ko,
+                           group.by = "annotation_refined",
+                           assay = "RNA")
+
+#Initialize CellchatDB
+CellChatDB <- CellChatDB.mouse
+CC_miRNAko@DB <- CellChatDB
+
+CC_miRNAko <- subsetData(CC_miRNAko)
+CC_miRNAko <- identifyOverExpressedGenes(CC_miRNAko)
+CC_miRNAko <- identifyOverExpressedInteractions(CC_miRNAko)
+
+#Try their projection approach to reduce dropout effects
+CC_miRNAko <- CellChat::smoothData(CC_miRNAko, adj = PPI.mouse)
+
+#Communication propability
+CC_miRNAko <- computeCommunProb(CC_miRNAko, population.size = T) 
+CC_miRNAko <- computeCommunProbPathway(CC_miRNAko)
+
+#Aggregated cell-cell communication
+CC_miRNAko <- aggregateNet(CC_miRNAko)
+CC_miRNAko <- netAnalysis_computeCentrality(CC_miRNAko)
+
+```
+
+##7.2 Create CellChat object for ctrl
+```{r}
+miRNA_obj_CTRL <- DO.Subset(miRNA_obj,
+                          ident = "condition",
+                          ident_name = "ctrl")
+
+#CellChat assumes a column called samples with orig.ident information
+miRNA_obj_CTRL$samples <- miRNA_obj_CTRL$orig.ident
+miRNA_obj_CTRL$samples <- factor(miRNA_obj_CTRL$samples)
+
+CC_CTRL <- createCellChat(miRNA_obj_CTRL,
+                           group.by = "annotation_refined",
+                           assay = "RNA")
+
+#Initialize CellchatDB
+CellChatDB <- CellChatDB.mouse
+CC_CTRL@DB <- CellChatDB
+
+CC_CTRL <- subsetData(CC_CTRL)
+CC_CTRL <- identifyOverExpressedGenes(CC_CTRL)
+CC_CTRL <- identifyOverExpressedInteractions(CC_CTRL)
+
+#Try their projection approach to reduce dropout effects
+CC_CTRL <- CellChat::smoothData(CC_CTRL, adj = PPI.mouse)
+
+#Communication propability
+CC_CTRL <- computeCommunProb(CC_CTRL, population.size = T) 
+CC_CTRL <- computeCommunProbPathway(CC_CTRL)
+
+#Aggregated cell-cell communication
+CC_CTRL <- aggregateNet(CC_CTRL)
+CC_CTRL <- netAnalysis_computeCentrality(CC_CTRL)
+```
+
+
+##7.3 Combined CellChat analysis
+```{r}
+#Continue with merging this object with the ctrl
+CC_list <- list(ctrl = CC_CTRL, miRNAko = CC_miRNAko)
+CC_merge <- mergeCellChat(CC_list, add.names = names(CC_list))
+
+
+#saveRDS(CC_merge, file = "/mnt/mariano/Sequencing_Storage/20250128_MRJ001_Julian_24096_snRNA_miR143_145-flox_Cdh5_CreERT2 (Cre+ vs Cre-) /24096/requests/forJulianW/260109_EC_cluster_comb/analysis/objects/260112_CellChat_miRNAko_EC_combined.rds")
+
+levels(CC_merge@idents$joint)
+
+##EC Interactions weights
+pdf(paste0(outputFolder, "analysis/plots/CellChat/InteractionNumber_EC_rest_circ.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = 7,
+                          title.name = "Interaction number EC vs Rest",
+                          arrow.width = 1,
+                          arrow.size = .5)
+dev.off()
+
+pdf(paste0(outputFolder, "analysis/plots/cellchat/InteractionNumber_EC_rest_circ_weight.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = 7,
+                          title.name = "Interaction number EC vs Rest",
+                          arrow.width = 1,
+                          arrow.size = .5,
+                          measure = "weight")
+dev.off()
+
+
+##EC reversed
+pdf(paste0(outputFolder, "analysis/plots/cellchat/InteractionNumber_rest_EC_circ.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          targets.use = 7,
+                          title.name = "Interaction number Rest vs EC",
+                          arrow.width = 1,
+                          arrow.size = .5)
+dev.off()
+
+pdf(paste0(outputFolder, "analysis/plots/cellchat/InteractionNumber_rest_EC_circ_weight.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          targets.use = 7,
+                          title.name = "Interaction number Rest vs EC",
+                          arrow.width = 1,
+                          arrow.size = .5,
+                          measure = "weight")
+dev.off()
+
+
+## LR-analysis with SEMA Collagene and laminine
+#Dotplot EC as source
+src_name <- "EC"
+target_names <- paste(levels(CC_merge@idents$joint)[levels(CC_merge@idents$joint) != src_name], collapse = "-")
+print(src_name)
+p <- netVisual_bubble(CC_merge,
+               sources.use = 7,
+               targets.use = which(levels(CC_merge@idents$joint) != src_name),
+               comparison = c(1,2),
+               angle.x = 45,
+               color.text = DOtools:::umap_colors)
+
+build_p <- ggplot_build(p)
+plot_names <- build_p$layout$panel_params[[1]]$y$get_labels()
+plot_names <- plot_names[!grepl("Ptprm  - Ptprm",plot_names)]
+
+pairLR_all <- CellChatDB.mouse$interaction
+pairLR_use <- pairLR_all[pairLR_all$interaction_name_2 %in% plot_names,]$pathway_name
+
+netVisual_bubble(CC_merge,
+               sources.use = 7,
+               targets.use = which(levels(CC_merge@idents$joint) != src_name),
+               comparison = c(1,2),
+               angle.x = 45,
+               color.text = DOtools:::umap_colors,
+               signaling = pairLR_use)
+
+ggsave(paste0(outputFolder, "analysis/plots/CellChat/LigandReceptor_analysis_",src_name,"_to_others_.pdf"), width = 8, height = 12) 
+
+#dotplot EC as target
+target_names <- "EC"
+src_name <- paste(levels(CC_merge@idents$joint)[levels(CC_merge@idents$joint) != target_names], collapse = "-")
+print(src_name)
+p <- netVisual_bubble(CC_merge,
+                 sources.use = which(levels(CC_merge@idents$joint) != target_names),
+                 targets.use = 7,
+                 comparison = c(1,2),
+                 angle.x = 45,
+                 color.text = DOtools:::umap_colors)
+
+build_p <- ggplot_build(p)
+plot_names <- build_p$layout$panel_params[[1]]$y$get_labels()
+plot_names <- plot_names[!grepl("Ptprm  - Ptprm",plot_names)]
+
+pairLR_all <- CellChatDB.mouse$interaction
+pairLR_use <- pairLR_all[pairLR_all$interaction_name_2 %in% plot_names,]$pathway_name
+
+netVisual_bubble(CC_merge,
+                 sources.use = which(levels(CC_merge@idents$joint) != target_names),
+                 targets.use = 7,
+                 comparison = c(1,2),
+                 angle.x = 45,
+                 color.text = DOtools:::umap_colors,
+                 signaling = pairLR_use)
+
+ggsave(paste0(outputFolder, "analysis/plots/cellchat/LigandReceptor_analysis_others_to_",target_names,".pdf"), width = 8, height = 13) 
+
+
+#create incoming-outgoing scatter plot for ECs between conditions
+gg1 <- netAnalysis_signalingChanges_scatter(CC_merge,
+                                          idents.use = "EC",
+                                          color.use = DOtools:::umap_colors,
+                                          top.label = 1,
+                                          # signaling.exclude = c("PTPRM","PECAM1"),
+                                          comparison = c(1,2))
+gg1 <- gg1+
+DOtools:::theme_box()+
+labs(title = paste0("Signaling changes upon miRNAko in ", "EC"))+
+theme(axis.text.x = element_text(color = "black",angle = 0,hjust = 1, size = 14),
+        axis.text.y = element_text(color = "black", size = 14),
+        axis.title.x = element_text(color = "black", size = 14),
+        axis.title = element_text(size = 14, color = "black"),
+        plot.title = element_text(size = 14, hjust = 0.5),
+        axis.line = element_line(color = "black"),
+        strip.text.x = element_text(size = 14, color = "black"),
+        legend.position = "right",
+        legend.text = element_text(size = 10, color = "black", family = "Helvetica"),
+        legend.title = element_text(size = 10, color = "black", family = "Helvetica", hjust =0))+
+guides(color = ggplot2::guide_legend(title = "Specifity", order = 1),
+       shape = ggplot2::guide_legend(title = "Direction", order = 2))
+gg1
+ggsave(paste0(outputFolder, "analysis/plots/CellCHat/Signaling_changes_in_EC_upon_miRNAko.pdf"), width = 8, height = 7)
+
+
+```
+
+#8. Load HCA data
+```{r}
+Human_HCA <- readRDS("/mnt/mariano/Temporary_Restore/Mariano/Human_Mice_Comparison/Seurat_and_R_objects/260402_Human_HF_complete.rds")
+Human_HCA <- DO.Subset(Human_HCA, ident = "disease", ident_name = c("CTRL.SP", "CTRL.LV"))
+Human_HCA$annotation <- plyr::revalue(Human_HCA$annotation, c("Ven_EC" = "EC",
+                                                              "Lym_EC" = "EC",
+                                                              "Cap_EC" = "EC",
+                                                              "Art_EC" = "EC"))
+DO.UMAP(Human_HCA, group.by = "annotation")
+
+#assign young old cutoff 55 years
+table(Human_HCA$AGE)
+Human_HCA$broad_AGE <- ifelse(Human_HCA$AGE %in% c("40-45", "45-50", "50-55"), "young", "old")
+table(Human_HCA$broad_AGE)
+```
+
+##8.1 Expression analysis off SERPINE1
+
+```{r}
+#subset by ECs
+Human_HCA_EC <- DO.Subset(Human_HCA, ident = "annotation", ident_name = "EC")
+table(Human_HCA_EC$broad_AGE)
+Human_HCA_EC$all <- ""
+
+Data_SERPINE1 <- DO.Barplot(Human_HCA_EC,
+           group.by = "broad_AGE",
+           Feature = "SERPINE1",
+           ctrl.condition = "young",
+           test_use = "MAST",
+           stat_pos_mod = 0.58,
+           returnValues = TRUE,
+           bar_colours = c("#d4d4d4ff","#F94F4F")) + coord_cartesian(ylim = c(0,1.05))
+
+ggsave(path(outputFolder, "/analysis/plots/Barplot_SERPINE1_MAST_young_old_EC.svg"), width = 5, height = 5.5)
+write.xlsx(Data_SERPINE1$df.melt.sum, file = path(outputFolder, "/analysis/plots/Data_sum_SERPINE1_young_old_EC.xlsx"))
+write.xlsx(Data_SERPINE1$df.melt.orig, file = path(outputFolder, "/analysis/plots/Data_orig_SERPINE1_young_old_EC.xlsx"))
+
+```
+
+#9. Dotplot expression Collagene genes
+```{r}
+
+collagenegenes <- c("Col3a1", "Col5a2", "Col15a1", "Col8a1", "Col4a1")
+
+#check if genes are in rownames
+lamagenes %in% rownames(miRNA_obj)
+collagenegenes %in% rownames(miRNA_obj)
+
+df_dotplot <- data.frame(
+    gene = c(collagenegenes),
+    cluster = c(rep("Collagen",5))
+)
+
+
+
+#as Violin plot
+for (gene in c(lamagenes, collagenegenes)) {
+    DO.VlnPlot(
+        tmp_EC,
+        Feature = gene,
+        group.by = "condition",
+        ctrl.condition = "ctrl",
+        group.by.2 = "all",
+        test_use = "wilcox",
+        vector_colors = c("lightgrey", "firebrick4")
+    )
+    
+    ggsave(paste0(outputFolder, "analysis/plots/Vlnplot_", gene, "_ECs_without_EndEC_wilcoxon_ctrl_miRNAko.pdf"), width = 4, height = 5)
+    
+}
+
+
+#statistics in Mean SEM plots
+
+stat_df <- data.frame()
+for (gene in c(lamagenes, collagenegenes)) {
+    
+    bar_df <- DO.Barplot(
+        tmp_EC,
+        Feature = gene,
+        group.by = "condition",
+        ctrl.condition = "ctrl",
+        test_use = "wilcox",
+        bar_colours = c("lightgrey", "firebrick4"),
+        returnValues = TRUE
+    )
+    
+    br_df <- bar_df$df.melt.sum
+    br_df$p_adj <- bar_df$stat.test$p.adj
+    
+    stat_df <- rbind(stat_df, br_df)
+    
+}
+
+write.xlsx(stat_df, file = paste0(outputFolder, "analysis/excels/Mean_SEM_Bar_stats_EC_without_EndEC_laminin_collagen.xlsx"))
+
+```
