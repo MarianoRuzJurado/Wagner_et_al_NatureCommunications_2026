@@ -679,7 +679,7 @@ Human_HCA$broad_AGE <- ifelse(Human_HCA$AGE %in% c("40-45", "45-50", "50-55"), "
 table(Human_HCA$broad_AGE)
 ```
 
-##8.1 Expression analysis off SERPINE1
+##8.1 Expression analysis of SERPINE1
 
 ```{r}
 #subset by ECs
